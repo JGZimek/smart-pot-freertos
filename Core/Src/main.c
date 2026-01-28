@@ -22,6 +22,7 @@
 #include "FreeRTOS.h"
 #include "adc.h"
 #include "i2c.h"
+#include "iwdg.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -97,6 +98,7 @@ int main(void)
   MX_ADC_Init();
   MX_USART1_UART_Init();
   MX_I2C2_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADCEx_Calibration_Start(&hadc);
   /* USER CODE END 2 */
@@ -136,10 +138,12 @@ void SystemClock_Config(void)
 
   /** Initializes the CPU, AHB and APB buses clocks
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.MSIState = RCC_MSI_ON;
   RCC_OscInitStruct.MSICalibrationValue = RCC_MSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+  RCC_OscInitStruct.LSIDiv = RCC_LSI_DIV1;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {

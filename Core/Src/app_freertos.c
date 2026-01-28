@@ -58,6 +58,8 @@ extern osMessageQueueId_t commandQueueHandle;
 
 extern UART_HandleTypeDef huart1;
 
+extern IWDG_HandleTypeDef hiwdg;
+
 // Bufor na jeden znak odebrany z klawiatury
 uint8_t rx_char;
 
@@ -419,7 +421,6 @@ void StartDisplayTask(void *argument)
 * @retval None
 */
 /* USER CODE END Header_StartButtonTask */
-/* USER CODE BEGIN Header_StartButtonTask */
 void StartButtonTask(void *argument)
 {
   /* USER CODE BEGIN StartButtonTask */
@@ -468,7 +469,6 @@ void StartButtonTask(void *argument)
 * @retval None
 */
 /* USER CODE END Header_StartControlTask */
-/* USER CODE BEGIN Header_StartControlTask */
 void StartControlTask(void *argument)
 {
   /* USER CODE BEGIN StartControlTask */
@@ -477,6 +477,8 @@ void StartControlTask(void *argument)
 
   for(;;)
   {
+	// --- TUTAJ ODŚWIEŻAMY WATCHDOGA ---
+	HAL_IWDG_Refresh(&hiwdg);
     // A. Komendy
     if (osMessageQueueGet(commandQueueHandle, &msg, NULL, 0) == osOK) {
         switch(msg.source) {
