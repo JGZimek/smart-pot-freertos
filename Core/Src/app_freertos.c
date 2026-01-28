@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include "adc.h"
 #include "lcd_i2c.h"
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -55,6 +56,11 @@ extern osMutexId_t lcdMutexHandle;
 extern osMessageQueueId_t sensorQueueHandle;
 extern osMessageQueueId_t commandQueueHandle;
 
+extern UART_HandleTypeDef huart1;
+
+// Bufor na jeden znak odebrany z klawiatury
+uint8_t rx_char;
+
 // --- GLOBALNY STAN SYSTEMU ---
 // ControlTask tu pisze, DisplayTask to czyta.
 typedef struct {
@@ -78,6 +84,9 @@ volatile SystemState_t sysState = {
 #define SOIL_DRY_THRESHOLD 1500  // Poniżej tego włączamy pompę
 #define SOIL_WET_THRESHOLD 1800  // Powyżej tego wyłączamy (histereza)
 #define WATER_MIN_LEVEL 200      // Minimum wody w zbiorniku
+
+#define SRC_ID_BUTTON 1
+#define SRC_ID_REMOTE 2
 
 /* USER CODE END Variables */
 /* Definitions for SoilTask */
@@ -122,6 +131,13 @@ const osThreadAttr_t ControlTask_attributes = {
   .priority = (osPriority_t) osPriorityBelowNormal,
   .stack_size = 256 * 4
 };
+/* Definitions for CommTask */
+osThreadId_t CommTaskHandle;
+const osThreadAttr_t CommTask_attributes = {
+  .name = "CommTask",
+  .priority = (osPriority_t) osPriorityNormal,
+  .stack_size = 256 * 4
+};
 /* Definitions for sensorQueue */
 osMessageQueueId_t sensorQueueHandle;
 const osMessageQueueAttr_t sensorQueue_attributes = {
@@ -157,6 +173,7 @@ void StartWaterTask(void *argument);
 void StartDisplayTask(void *argument);
 void StartButtonTask(void *argument);
 void StartControlTask(void *argument);
+void StartCommTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -217,6 +234,9 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of ControlTask */
   ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
+
+  /* creation of CommTask */
+  CommTaskHandle = osThreadNew(StartCommTask, NULL, &CommTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -325,7 +345,6 @@ void StartWaterTask(void *argument)
 * @retval None
 */
 /* USER CODE END Header_StartDisplayTask */
-/* USER CODE BEGIN Header_StartDisplayTask */
 void StartDisplayTask(void *argument)
 {
   /* USER CODE BEGIN StartDisplayTask */
@@ -392,6 +411,7 @@ void StartDisplayTask(void *argument)
   }
   /* USER CODE END StartDisplayTask */
 }
+
 /* USER CODE BEGIN Header_StartButtonTask */
 /**
 * @brief Function implementing the ButtonTask thread.
@@ -403,13 +423,13 @@ void StartDisplayTask(void *argument)
 void StartButtonTask(void *argument)
 {
   /* USER CODE BEGIN StartButtonTask */
+  SetPumpHardware(0);
   uint8_t last_btn_view = 1;
   uint8_t last_btn_mode = 1;
-  uint8_t last_btn_pump = 1; // Do wykrywania zmiany stanu przycisku pompy
+  uint8_t last_btn_pump = 1;
 
   for(;;)
   {
-    // Odczyt (zakładam piny jak wcześniej: PA0, PA1, PA2)
     uint8_t curr_btn_view = HAL_GPIO_ReadPin(BTN_VIEW_GPIO_Port, BTN_VIEW_Pin);
     uint8_t curr_btn_mode = HAL_GPIO_ReadPin(BTN_MODE_GPIO_Port, BTN_MODE_Pin);
     uint8_t curr_btn_pump = HAL_GPIO_ReadPin(BTN_PUMP_GPIO_Port, BTN_PUMP_Pin);
@@ -426,17 +446,17 @@ void StartButtonTask(void *argument)
     }
     last_btn_mode = curr_btn_mode;
 
-    // 3. Sterowanie manualne (Wysyłamy komendę tylko przy ZMIANIE stanu)
+    // 3. Sterowanie manualne (Podpisujemy jako SRC_ID_BUTTON)
     if (curr_btn_pump != last_btn_pump) {
         if (curr_btn_pump == 0) {
-            SendCommand(MSG_CMD_PUMP_REQ_ON, 0); // Wciśnięto
+            SendCommand(MSG_CMD_PUMP_REQ_ON, SRC_ID_BUTTON); // <--- ZMIANA
         } else {
-            SendCommand(MSG_CMD_PUMP_REQ_OFF, 0); // Puszczono
+            SendCommand(MSG_CMD_PUMP_REQ_OFF, SRC_ID_BUTTON); // <--- ZMIANA
         }
         last_btn_pump = curr_btn_pump;
     }
 
-    osDelay(20); // Debouncing
+    osDelay(20);
   }
   /* USER CODE END StartButtonTask */
 }
@@ -453,42 +473,54 @@ void StartControlTask(void *argument)
 {
   /* USER CODE BEGIN StartControlTask */
   AppMsg_t msg;
-
-  // Bezpieczny start - pompa OFF
   SetPumpHardware(0);
 
   for(;;)
   {
-    // A. Komendy (Timeout 0 - sprawdzamy szybko)
+    // A. Komendy
     if (osMessageQueueGet(commandQueueHandle, &msg, NULL, 0) == osOK) {
         switch(msg.source) {
             case MSG_CMD_CHANGE_VIEW:
                 sysState.view++;
                 if (sysState.view > VIEW_LIGHT) sysState.view = VIEW_ALL;
                 break;
+
             case MSG_CMD_CHANGE_MODE:
                 sysState.mode++;
                 if (sysState.mode > MODE_REMOTE) sysState.mode = MODE_MANUAL;
-                SetPumpHardware(0); // Safety reset
+
+                // Zawsze resetuj pompę przy zmianie trybu
+                SetPumpHardware(0);
                 sysState.pump_active = 0;
                 break;
+
             case MSG_CMD_PUMP_REQ_ON:
-                if (sysState.mode == MODE_MANUAL) {
+                // Logika:
+                // - Jeśli tryb MANUAL -> akceptuj tylko od PRZYCISKU (SRC_ID_BUTTON)
+                // - Jeśli tryb REMOTE -> akceptuj tylko od UART (SRC_ID_REMOTE)
+                if ( (sysState.mode == MODE_MANUAL && msg.value == SRC_ID_BUTTON) ||
+                     (sysState.mode == MODE_REMOTE && msg.value == SRC_ID_REMOTE) )
+                {
                     SetPumpHardware(1);
                     sysState.pump_active = 1;
                 }
                 break;
+
             case MSG_CMD_PUMP_REQ_OFF:
-                if (sysState.mode == MODE_MANUAL) {
+                // Ta sama logika dla wyłączania
+                if ( (sysState.mode == MODE_MANUAL && msg.value == SRC_ID_BUTTON) ||
+                     (sysState.mode == MODE_REMOTE && msg.value == SRC_ID_REMOTE) )
+                {
                     SetPumpHardware(0);
                     sysState.pump_active = 0;
                 }
                 break;
+
             default: break;
         }
     }
 
-    // B. Sensory (Timeout 5ms - czekamy chwilę na dane)
+    // B. Sensory (bez zmian)
     if (osMessageQueueGet(sensorQueueHandle, &msg, NULL, 5) == osOK) {
         switch(msg.source) {
             case MSG_SRC_SENSOR_SOIL:  sysState.soil = msg.value; break;
@@ -498,16 +530,14 @@ void StartControlTask(void *argument)
         }
     }
 
-    // C. Logika AUTO
+    // C. Logika AUTO (bez zmian)
     if (sysState.mode == MODE_AUTO) {
-        // Włącz jeśli sucho (<1500) i jest woda (>200)
         if (sysState.soil < SOIL_DRY_THRESHOLD && sysState.water > WATER_MIN_LEVEL) {
             if (sysState.pump_active == 0) {
                 SetPumpHardware(1);
                 sysState.pump_active = 1;
             }
         }
-        // Wyłącz jeśli mokro (>1800) lub brak wody
         else if (sysState.soil > SOIL_WET_THRESHOLD || sysState.water < WATER_MIN_LEVEL) {
             if (sysState.pump_active == 1) {
                 SetPumpHardware(0);
@@ -516,10 +546,46 @@ void StartControlTask(void *argument)
         }
     }
 
-    // Ważne: Krótki delay, żeby dać czas innym procesom (np. UART)
     osDelay(10);
   }
   /* USER CODE END StartControlTask */
+}
+
+/* USER CODE BEGIN Header_StartCommTask */
+/**
+* @brief Function implementing the CommTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartCommTask */
+void StartCommTask(void *argument)
+{
+  /* USER CODE BEGIN StartCommTask */
+
+  // 1. Start nasłuchu na przerwanie (używamy poprawnej nazwy zmiennej 'rx_char')
+  HAL_UART_Receive_IT(&huart1, &rx_char, 1);
+
+  for(;;)
+  {
+    // 2. Czekaj na flagę od przerwania
+    osThreadFlagsWait(0x01, osFlagsWaitAny, osWaitForever);
+
+    // 3. Logika komend
+    // Wysyłamy komendę z podpisem SRC_ID_REMOTE (2)
+    if (rx_char == '1') {
+        printf("\r\nREMOTE: Sent ON request\r\n");
+        SendCommand(MSG_CMD_PUMP_REQ_ON, SRC_ID_REMOTE);
+    }
+    else if (rx_char == '0') {
+        printf("\r\nREMOTE: Sent OFF request\r\n");
+        SendCommand(MSG_CMD_PUMP_REQ_OFF, SRC_ID_REMOTE);
+    }
+    // Opcjonalnie: ignoruj inne znaki (np. Enter)
+
+    // 4. Wznów nasłuch (ponownie używamy poprawnej nazwy 'rx_char')
+    HAL_UART_Receive_IT(&huart1, &rx_char, 1);
+  }
+  /* USER CODE END StartCommTask */
 }
 
 /* Private application code --------------------------------------------------*/
@@ -556,6 +622,15 @@ void SetPumpHardware(uint8_t state) {
     } else {
         // Active LOW (Wyłącz)
         HAL_GPIO_WritePin(RELAY_PUMP_GPIO_Port, RELAY_PUMP_Pin, GPIO_PIN_SET);
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    // Sprawdzamy, czy przerwanie przyszło z UART1
+    if (huart->Instance == USART1) {
+        // Wyślij sygnał (flaga nr 1) do CommTask, żeby go obudzić
+        osThreadFlagsSet(CommTaskHandle, 0x01);
     }
 }
 /* USER CODE END Application */
