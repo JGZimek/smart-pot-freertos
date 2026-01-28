@@ -65,6 +65,13 @@ const osThreadAttr_t LightTask_attributes = {
   .priority = (osPriority_t) osPriorityLow,
   .stack_size = 256 * 4
 };
+/* Definitions for WaterTask */
+osThreadId_t WaterTaskHandle;
+const osThreadAttr_t WaterTask_attributes = {
+  .name = "WaterTask",
+  .priority = (osPriority_t) osPriorityLow,
+  .stack_size = 256 * 4
+};
 /* Definitions for adcMutex */
 osMutexId_t adcMutexHandle;
 const osMutexAttr_t adcMutex_attributes = {
@@ -78,6 +85,7 @@ const osMutexAttr_t adcMutex_attributes = {
 
 void StartSoilTask(void *argument);
 void StartLightTask(void *argument);
+void StartWaterTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -116,6 +124,9 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of LightTask */
   LightTaskHandle = osThreadNew(StartLightTask, NULL, &LightTask_attributes);
+
+  /* creation of WaterTask */
+  WaterTaskHandle = osThreadNew(StartWaterTask, NULL, &WaterTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -203,6 +214,40 @@ void StartLightTask(void *argument)
 
     osDelay(1000); // Co 1 sekunda
   }
+}
+
+/* USER CODE BEGIN Header_StartWaterTask */
+/**
+* @brief Function implementing the WaterTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartWaterTask */
+void StartWaterTask(void *argument)
+{
+  /* USER CODE BEGIN StartWaterTask */
+  uint32_t water_val = 0;
+  osDelay(666); // Przesunięcie startu
+
+  for(;;)
+  {
+    osMutexAcquire(adcMutexHandle, osWaitForever);
+
+    // Kanał 4 (Woda) - PB2
+    ADC_Select_Channel(ADC_CHANNEL_4);
+
+    HAL_ADC_Start(&hadc);
+    if (HAL_ADC_PollForConversion(&hadc, 100) == HAL_OK) {
+        water_val = HAL_ADC_GetValue(&hadc);
+    }
+    HAL_ADC_Stop(&hadc);
+
+    osMutexRelease(adcMutexHandle);
+
+    printf("[WATER] Value: %lu\r\n", water_val);
+    osDelay(1000);
+  }
+  /* USER CODE END StartWaterTask */
 }
 
 /* Private application code --------------------------------------------------*/
