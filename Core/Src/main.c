@@ -21,7 +21,6 @@
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "adc.h"
-#include "dma.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -94,13 +93,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_ADC_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_ADCEx_Calibration_Start(&hadc); // Kalibracja
-  HAL_ADC_Start_DMA(&hadc, (uint32_t*)&soil_raw_value, 1);
-
+  HAL_ADCEx_Calibration_Start(&hadc);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -166,8 +162,12 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-int _write(int file, char *ptr, int len) {
-  HAL_UART_Transmit(&huart1, (uint8_t*)ptr, len, 100);
+int _write(int file, char *ptr, int len)
+{
+  // Wysyłamy surowe bajty przez UART1
+  if (HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, 100) != HAL_OK) {
+      return -1;
+  }
   return len;
 }
 

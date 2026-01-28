@@ -26,7 +26,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include "adc.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -115,11 +116,28 @@ void MX_FREERTOS_Init(void) {
 /* USER CODE END Header_StartSoilTask */
 void StartSoilTask(void *argument)
 {
+  /* USER CODE BEGIN StartSoilTask */
+  uint32_t raw_val = 0;
+
   for(;;)
   {
-    printf("Soil Raw Value: %lu\r\n", soil_raw_value);
-    osDelay(500); // Odczyt co pół sekundy
+    // 1. Miganie diodą PB5 - diagnostyka czy task żyje
+    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_5);
+
+    // 2. Ręczny odczyt ADC (klasyczny polling)
+    HAL_ADC_Start(&hadc); // Startuj pomiar
+    if (HAL_ADC_PollForConversion(&hadc, 10) == HAL_OK) // Czekaj max 10ms
+    {
+      raw_val = HAL_ADC_GetValue(&hadc); // Pobierz wartość
+    }
+    HAL_ADC_Stop(&hadc); // Zatrzymaj ADC
+
+    // 3. Wypisanie na UART
+    printf("Soil Value (Polling): %lu\r\n", raw_val);
+
+    osDelay(500); // Czekaj 0.5s
   }
+  /* USER CODE END StartSoilTask */
 }
 
 /* Private application code --------------------------------------------------*/
