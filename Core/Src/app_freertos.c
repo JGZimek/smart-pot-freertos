@@ -48,17 +48,36 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-extern volatile uint32_t soil_raw_value;
 extern osMutexId_t adcMutexHandle;
+extern osMutexId_t lcdMutexHandle;
+
+// Kolejki zdefiniowane w CubeMX
 extern osMessageQueueId_t sensorQueueHandle;
+extern osMessageQueueId_t commandQueueHandle;
 
-static DisplayView_t current_view = VIEW_ALL;
-static ControlMode_t current_mode = MODE_MANUAL;
-static uint8_t is_pump_on = 0;
+// --- GLOBALNY STAN SYSTEMU ---
+// ControlTask tu pisze, DisplayTask to czyta.
+typedef struct {
+    uint32_t soil;
+    uint32_t light;
+    uint32_t water;
+    ControlMode_t mode;
+    DisplayView_t view;
+    uint8_t pump_active;
+} SystemState_t;
 
-static uint32_t last_soil = 0;
-static uint32_t last_light = 0;
-static uint32_t last_water = 0;
+// Inicjalizacja stanu zerowego
+volatile SystemState_t sysState = {
+    .soil = 0, .light = 0, .water = 0,
+    .mode = MODE_MANUAL,
+    .view = VIEW_ALL,
+    .pump_active = 0
+};
+
+// Progi dla automatyki
+#define SOIL_DRY_THRESHOLD 1500  // Poniżej tego włączamy pompę
+#define SOIL_WET_THRESHOLD 1800  // Powyżej tego wyłączamy (histereza)
+#define WATER_MIN_LEVEL 200      // Minimum wody w zbiorniku
 
 /* USER CODE END Variables */
 /* Definitions for SoilTask */
@@ -96,10 +115,22 @@ const osThreadAttr_t ButtonTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
   .stack_size = 128 * 4
 };
+/* Definitions for ControlTask */
+osThreadId_t ControlTaskHandle;
+const osThreadAttr_t ControlTask_attributes = {
+  .name = "ControlTask",
+  .priority = (osPriority_t) osPriorityBelowNormal,
+  .stack_size = 256 * 4
+};
 /* Definitions for sensorQueue */
 osMessageQueueId_t sensorQueueHandle;
 const osMessageQueueAttr_t sensorQueue_attributes = {
   .name = "sensorQueue"
+};
+/* Definitions for commandQueue */
+osMessageQueueId_t commandQueueHandle;
+const osMessageQueueAttr_t commandQueue_attributes = {
+  .name = "commandQueue"
 };
 /* Definitions for adcMutex */
 osMutexId_t adcMutexHandle;
@@ -115,9 +146,9 @@ const osMutexAttr_t lcdMutex_attributes = {
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 void ADC_Select_Channel(uint32_t channel);
-void SendAppMessage(MsgSource_t src, uint32_t val);
-void SetPumpState(uint8_t state);
-
+void SendSensorData(MsgSource_t src, uint32_t val);
+void SendCommand(MsgSource_t src, uint32_t val);
+void SetPumpHardware(uint8_t state);
 /* USER CODE END FunctionPrototypes */
 
 void StartSoilTask(void *argument);
@@ -125,6 +156,7 @@ void StartLightTask(void *argument);
 void StartWaterTask(void *argument);
 void StartDisplayTask(void *argument);
 void StartButtonTask(void *argument);
+void StartControlTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -160,6 +192,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of sensorQueue */
   sensorQueueHandle = osMessageQueueNew (16, 8, &sensorQueue_attributes);
 
+  /* creation of commandQueue */
+  commandQueueHandle = osMessageQueueNew (8, 8, &commandQueue_attributes);
+
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
@@ -179,6 +214,9 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of ButtonTask */
   ButtonTaskHandle = osThreadNew(StartButtonTask, NULL, &ButtonTask_attributes);
+
+  /* creation of ControlTask */
+  ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -209,7 +247,7 @@ void StartSoilTask(void *argument)
     if (HAL_ADC_PollForConversion(&hadc, 100) == HAL_OK) {
         raw = HAL_ADC_GetValue(&hadc);
         // WYŚLIJ DO KOLEJKI
-        SendAppMessage(MSG_SRC_SENSOR_SOIL, raw);
+        SendSensorData(MSG_SRC_SENSOR_SOIL, raw);
     }
     HAL_ADC_Stop(&hadc);
     osMutexRelease(adcMutexHandle);
@@ -240,7 +278,7 @@ void StartLightTask(void *argument)
     if (HAL_ADC_PollForConversion(&hadc, 100) == HAL_OK) {
         raw = HAL_ADC_GetValue(&hadc);
         // WYŚLIJ DO KOLEJKI
-        SendAppMessage(MSG_SRC_SENSOR_LIGHT, raw);
+        SendSensorData(MSG_SRC_SENSOR_LIGHT, raw);
     }
     HAL_ADC_Stop(&hadc);
     osMutexRelease(adcMutexHandle);
@@ -270,7 +308,7 @@ void StartWaterTask(void *argument)
     if (HAL_ADC_PollForConversion(&hadc, 100) == HAL_OK) {
         raw = HAL_ADC_GetValue(&hadc);
         // WYŚLIJ DO KOLEJKI
-        SendAppMessage(MSG_SRC_SENSOR_WATER, raw);
+        SendSensorData(MSG_SRC_SENSOR_WATER, raw);
     }
     HAL_ADC_Stop(&hadc);
     osMutexRelease(adcMutexHandle);
@@ -287,10 +325,10 @@ void StartWaterTask(void *argument)
 * @retval None
 */
 /* USER CODE END Header_StartDisplayTask */
+/* USER CODE BEGIN Header_StartDisplayTask */
 void StartDisplayTask(void *argument)
 {
   /* USER CODE BEGIN StartDisplayTask */
-  AppMsg_t msg;
   char lcd_line1[17];
   char lcd_line2[17];
 
@@ -302,70 +340,58 @@ void StartDisplayTask(void *argument)
 
   for(;;)
   {
-    // Czekaj na wiadomość
-    if (osMessageQueueGet(sensorQueueHandle, &msg, NULL, osWaitForever) == osOK)
-    {
-        // Aktualizacja zmiennych
-        switch(msg.source) {
-            case MSG_SRC_SENSOR_SOIL:  last_soil = msg.value; break;
-            case MSG_SRC_SENSOR_LIGHT: last_light = msg.value; break;
-            case MSG_SRC_SENSOR_WATER: last_water = msg.value; break;
-            default: break;
-        }
+    // 1. Logowanie UART (Co odświeżenie ekranu)
+    // Przywrócony printf z \r\n na końcu
+    printf("S:%lu L:%lu W:%lu | Mode:%d View:%d P:%d\r\n",
+           sysState.soil, sysState.light, sysState.water,
+           sysState.mode, sysState.view, sysState.pump_active);
 
-        printf("S:%lu L:%lu W:%lu | Mode:%d View:%d P:%d\r\n",
-        			last_soil, last_light, last_water, current_mode, current_view, is_pump_on);
+    // 2. Obsługa LCD
+    osMutexAcquire(lcdMutexHandle, osWaitForever);
 
-        // Obsługa LCD
-        osMutexAcquire(lcdMutexHandle, osWaitForever);
-
-        // --- LINIA 1: Dane ---
-        lcd_put_cur(0, 0);
-        switch(current_view) {
-            case VIEW_ALL:
-                // Format: "S:1234 L:123 W:12" (ciasno, ale wejdzie)
-                // Używamy %4lu ale jeśli liczba mniejsza to spacje.
-                // S:%lu zajmie zmienną ilość. Spróbujmy na sztywno:
-                // S1234 L1234 W123
-                sprintf(lcd_line1, "S%4lu L%4lu W%3lu", last_soil, last_light, last_water);
-                break;
-            case VIEW_SOIL:
-                sprintf(lcd_line1, "Soil:  %-4lu     ", last_soil);
-                break;
-            case VIEW_WATER:
-                sprintf(lcd_line1, "Water: %-4lu     ", last_water);
-                break;
-            case VIEW_LIGHT:
-                sprintf(lcd_line1, "Light: %-4lu     ", last_light);
-                break;
-        }
-        lcd_send_string(lcd_line1);
-
-        // --- LINIA 2: Status ---
-        lcd_put_cur(1, 0);
-
-        char pump_char = is_pump_on ? '*' : ' ';
-        char *mode_str = "MAN";
-
-        if (current_mode == MODE_AUTO) mode_str = "AUT";
-        else if (current_mode == MODE_REMOTE) mode_str = "RMT ";
-
-        if (current_view == VIEW_ALL) {
-             // Wersja skrócona bez zbędnych nawiasów
-             // M:AUTO P:*
-             sprintf(lcd_line2, "M:%s P:[%c]     ", mode_str, pump_char);
-        } else {
-             // Wersja pełna
-             sprintf(lcd_line2, "Mode:%s P:[%c]   ", mode_str, pump_char);
-        }
-        lcd_send_string(lcd_line2);
-
-        osMutexRelease(lcdMutexHandle);
+    // --- LINIA 1: Dane ---
+    lcd_put_cur(0, 0);
+    switch(sysState.view) {
+        case VIEW_ALL:
+            // S1234 L1234 W123
+            sprintf(lcd_line1, "S%4lu L%4lu W%3lu", sysState.soil, sysState.light, (sysState.water > 999 ? 999 : sysState.water));
+            break;
+        case VIEW_SOIL:
+            sprintf(lcd_line1, "Soil:  %-4lu     ", sysState.soil);
+            break;
+        case VIEW_WATER:
+            sprintf(lcd_line1, "Water: %-4lu     ", sysState.water);
+            break;
+        case VIEW_LIGHT:
+            sprintf(lcd_line1, "Light: %-4lu     ", sysState.light);
+            break;
     }
+    lcd_send_string(lcd_line1);
+
+    // --- LINIA 2: Status ---
+    lcd_put_cur(1, 0);
+
+    char *mode_str = "MAN";
+    if (sysState.mode == MODE_AUTO) mode_str = "AUT";
+    else if (sysState.mode == MODE_REMOTE) mode_str = "RMT";
+
+    char pump_char = sysState.pump_active ? '*' : ' ';
+
+    if (sysState.view == VIEW_ALL) {
+         // Powrót do Twojego formatu: M:MAN P:[ ]
+         sprintf(lcd_line2, "M:%s P:[%c]     ", mode_str, pump_char);
+    } else {
+         // Pełny format dla widoków szczegółowych
+         sprintf(lcd_line2, "Mode:%s P:[%c]   ", mode_str, pump_char);
+    }
+    lcd_send_string(lcd_line2);
+
+    osMutexRelease(lcdMutexHandle);
+
+    osDelay(500); // Odświeżanie 2Hz (optymalne dla UART i oczu)
   }
   /* USER CODE END StartDisplayTask */
 }
-
 /* USER CODE BEGIN Header_StartButtonTask */
 /**
 * @brief Function implementing the ButtonTask thread.
@@ -373,68 +399,132 @@ void StartDisplayTask(void *argument)
 * @retval None
 */
 /* USER CODE END Header_StartButtonTask */
+/* USER CODE BEGIN Header_StartButtonTask */
 void StartButtonTask(void *argument)
 {
   /* USER CODE BEGIN StartButtonTask */
-
-  // 1. INICJALIZACJA: Upewnij się, że pompa jest wyłączona na starcie
-  // Ponieważ używamy Active LOW, SetPumpState(0) ustawi pin w stan WYSOKI (3.3V)
-  SetPumpState(0);
-
-  // Stany poprzednie do wykrywania zboczy (1 = przycisk puszczony)
   uint8_t last_btn_view = 1;
   uint8_t last_btn_mode = 1;
+  uint8_t last_btn_pump = 1; // Do wykrywania zmiany stanu przycisku pompy
 
   for(;;)
   {
-    // 2. Odczyt stanów (Pull-Up: wciśnięty = 0, puszczony = 1)
+    // Odczyt (zakładam piny jak wcześniej: PA0, PA1, PA2)
     uint8_t curr_btn_view = HAL_GPIO_ReadPin(BTN_VIEW_GPIO_Port, BTN_VIEW_Pin);
     uint8_t curr_btn_mode = HAL_GPIO_ReadPin(BTN_MODE_GPIO_Port, BTN_MODE_Pin);
     uint8_t curr_btn_pump = HAL_GPIO_ReadPin(BTN_PUMP_GPIO_Port, BTN_PUMP_Pin);
 
-    // 3. Obsługa PRZYCISKU 1 (Zmiana Widoku) - Zbocze opadające
+    // 1. Zmiana widoku
     if (last_btn_view == 1 && curr_btn_view == 0) {
-        current_view++;
-        if (current_view > VIEW_LIGHT) current_view = VIEW_ALL;
-
-        // Odśwież LCD natychmiast
-        SendAppMessage(MSG_SRC_BUTTON_VIEW, 0);
+        SendCommand(MSG_CMD_CHANGE_VIEW, 0);
     }
     last_btn_view = curr_btn_view;
 
-    // 4. Obsługa PRZYCISKU 2 (Zmiana Trybu) - Zbocze opadające
+    // 2. Zmiana trybu
     if (last_btn_mode == 1 && curr_btn_mode == 0) {
-        current_mode++;
-        if (current_mode > MODE_REMOTE) current_mode = MODE_AUTO;
-
-        // Wyłącz pompę przy każdej zmianie trybu dla bezpieczeństwa
-        SetPumpState(0);
-
-        SendAppMessage(MSG_SRC_BUTTON_MODE, 0);
+        SendCommand(MSG_CMD_CHANGE_MODE, 0);
     }
     last_btn_mode = curr_btn_mode;
 
-    // 5. Obsługa PRZYCISKU 3 (Pompa Manualna) - Działa tylko w trybie MANUAL
-    if (current_mode == MODE_MANUAL) {
-        if (curr_btn_pump == 0) { // Przycisk trzymany (Stan niski)
-            if (is_pump_on == 0) SetPumpState(1); // Włącz (logika w funkcji SetPumpState zrobi reset pinu)
-        } else { // Przycisk puszczony
-            if (is_pump_on == 1) SetPumpState(0); // Wyłącz (ustaw pin)
+    // 3. Sterowanie manualne (Wysyłamy komendę tylko przy ZMIANIE stanu)
+    if (curr_btn_pump != last_btn_pump) {
+        if (curr_btn_pump == 0) {
+            SendCommand(MSG_CMD_PUMP_REQ_ON, 0); // Wciśnięto
+        } else {
+            SendCommand(MSG_CMD_PUMP_REQ_OFF, 0); // Puszczono
         }
-    } else {
-        // Zabezpieczenie: jeśli w innym trybie pompa została włączona, wyłącz ją
-        if (is_pump_on && current_mode != MODE_AUTO) SetPumpState(0);
+        last_btn_pump = curr_btn_pump;
     }
 
-    osDelay(20); // Debouncing (filtracja drgań styków)
+    osDelay(20); // Debouncing
   }
   /* USER CODE END StartButtonTask */
 }
 
+/* USER CODE BEGIN Header_StartControlTask */
+/**
+* @brief Function implementing the ControlTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartControlTask */
+/* USER CODE BEGIN Header_StartControlTask */
+void StartControlTask(void *argument)
+{
+  /* USER CODE BEGIN StartControlTask */
+  AppMsg_t msg;
+
+  // Bezpieczny start - pompa OFF
+  SetPumpHardware(0);
+
+  for(;;)
+  {
+    // A. Komendy (Timeout 0 - sprawdzamy szybko)
+    if (osMessageQueueGet(commandQueueHandle, &msg, NULL, 0) == osOK) {
+        switch(msg.source) {
+            case MSG_CMD_CHANGE_VIEW:
+                sysState.view++;
+                if (sysState.view > VIEW_LIGHT) sysState.view = VIEW_ALL;
+                break;
+            case MSG_CMD_CHANGE_MODE:
+                sysState.mode++;
+                if (sysState.mode > MODE_REMOTE) sysState.mode = MODE_MANUAL;
+                SetPumpHardware(0); // Safety reset
+                sysState.pump_active = 0;
+                break;
+            case MSG_CMD_PUMP_REQ_ON:
+                if (sysState.mode == MODE_MANUAL) {
+                    SetPumpHardware(1);
+                    sysState.pump_active = 1;
+                }
+                break;
+            case MSG_CMD_PUMP_REQ_OFF:
+                if (sysState.mode == MODE_MANUAL) {
+                    SetPumpHardware(0);
+                    sysState.pump_active = 0;
+                }
+                break;
+            default: break;
+        }
+    }
+
+    // B. Sensory (Timeout 5ms - czekamy chwilę na dane)
+    if (osMessageQueueGet(sensorQueueHandle, &msg, NULL, 5) == osOK) {
+        switch(msg.source) {
+            case MSG_SRC_SENSOR_SOIL:  sysState.soil = msg.value; break;
+            case MSG_SRC_SENSOR_LIGHT: sysState.light = msg.value; break;
+            case MSG_SRC_SENSOR_WATER: sysState.water = msg.value; break;
+            default: break;
+        }
+    }
+
+    // C. Logika AUTO
+    if (sysState.mode == MODE_AUTO) {
+        // Włącz jeśli sucho (<1500) i jest woda (>200)
+        if (sysState.soil < SOIL_DRY_THRESHOLD && sysState.water > WATER_MIN_LEVEL) {
+            if (sysState.pump_active == 0) {
+                SetPumpHardware(1);
+                sysState.pump_active = 1;
+            }
+        }
+        // Wyłącz jeśli mokro (>1800) lub brak wody
+        else if (sysState.soil > SOIL_WET_THRESHOLD || sysState.water < WATER_MIN_LEVEL) {
+            if (sysState.pump_active == 1) {
+                SetPumpHardware(0);
+                sysState.pump_active = 0;
+            }
+        }
+    }
+
+    // Ważne: Krótki delay, żeby dać czas innym procesom (np. UART)
+    osDelay(10);
+  }
+  /* USER CODE END StartControlTask */
+}
+
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-void ADC_Select_Channel(uint32_t channel)
-{
+void ADC_Select_Channel(uint32_t channel) {
   ADC_ChannelConfTypeDef sConfig = {0};
   sConfig.Channel = channel;
   sConfig.Rank = ADC_REGULAR_RANK_1;
@@ -442,23 +532,30 @@ void ADC_Select_Channel(uint32_t channel)
   if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK) { Error_Handler(); }
 }
 
-void SendAppMessage(MsgSource_t src, uint32_t val) {
+// Wysyła dane do kolejki czujników
+void SendSensorData(MsgSource_t src, uint32_t val) {
     AppMsg_t msg;
     msg.source = src;
     msg.value = val;
     osMessageQueuePut(sensorQueueHandle, &msg, 0, 0);
 }
 
-void SetPumpState(uint8_t state) {
-    if (state == 1) {
-        // WŁĄCZANIE: Stan NISKI (GND) uruchamia przekaźnik
-        HAL_GPIO_WritePin(RELAY_PUMP_GPIO_Port, RELAY_PUMP_Pin, GPIO_PIN_RESET);
-        is_pump_on = 1;
-    } else {
-        // WYŁĄCZANIE: Stan WYSOKI (3.3V) wyłącza przekaźnik
-        HAL_GPIO_WritePin(RELAY_PUMP_GPIO_Port, RELAY_PUMP_Pin, GPIO_PIN_SET);
-        is_pump_on = 0;
-    }
+// Wysyła dane do kolejki komend (przyciski)
+void SendCommand(MsgSource_t src, uint32_t val) {
+    AppMsg_t msg;
+    msg.source = src;
+    msg.value = val;
+    osMessageQueuePut(commandQueueHandle, &msg, 0, 0);
 }
 
+// Sterownik sprzętowy pompy (tylko włącz/wyłącz pin)
+void SetPumpHardware(uint8_t state) {
+    if (state == 1) {
+        // Active LOW (Włącz)
+        HAL_GPIO_WritePin(RELAY_PUMP_GPIO_Port, RELAY_PUMP_Pin, GPIO_PIN_RESET);
+    } else {
+        // Active LOW (Wyłącz)
+        HAL_GPIO_WritePin(RELAY_PUMP_GPIO_Port, RELAY_PUMP_Pin, GPIO_PIN_SET);
+    }
+}
 /* USER CODE END Application */

@@ -36,33 +36,37 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
-// Typy źródeł danych dla kolejki
+// Typy źródeł
 typedef enum {
+    // --- SENSORS (idą do sensorQueue) ---
     MSG_SRC_SENSOR_SOIL,
     MSG_SRC_SENSOR_LIGHT,
     MSG_SRC_SENSOR_WATER,
-    MSG_SRC_BUTTON_VIEW,  // Nowe: Odśwież bo zmieniono widok
-    MSG_SRC_BUTTON_MODE   // Nowe: Odśwież bo zmieniono tryb
+    // --- COMMANDS (idą do commandQueue) ---
+    MSG_CMD_CHANGE_VIEW,
+    MSG_CMD_CHANGE_MODE,
+    MSG_CMD_PUMP_REQ_ON,  // Żądanie włączenia pompy (manual)
+    MSG_CMD_PUMP_REQ_OFF  // Żądanie wyłączenia pompy (manual)
 } MsgSource_t;
 
-// Struktura wiadomości w kolejce
+// Struktura wiadomości (wspólna dla obu kolejek dla uproszczenia)
 typedef struct {
     MsgSource_t source;
-    uint32_t value; // Dla sensorów to pomiar, dla przycisków może być puste
+    uint32_t value;
 } AppMsg_t;
 
-// --- DEFINICJE STANÓW SYSTEMU ---
+// --- STANY ---
 typedef enum {
-    VIEW_ALL,   // Pokazuj wszystko (jak teraz)
-    VIEW_SOIL,  // Tylko gleba
-    VIEW_WATER, // Tylko woda
-    VIEW_LIGHT  // Tylko światło
+    VIEW_ALL,
+    VIEW_SOIL,
+    VIEW_WATER,
+    VIEW_LIGHT
 } DisplayView_t;
 
 typedef enum {
-    MODE_AUTO,   // Automat decyduje o podlewaniu
     MODE_MANUAL, // Tylko przycisk
-    MODE_REMOTE  // Czekamy na komendy z LoRa/Zigbee (na przyszłość)
+    MODE_AUTO,   // Logika wilgotności
+    MODE_REMOTE
 } ControlMode_t;
 /* USER CODE END ET */
 
