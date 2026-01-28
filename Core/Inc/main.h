@@ -36,6 +36,16 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
+typedef enum {
+    SENSOR_SOIL,
+    SENSOR_LIGHT,
+    SENSOR_WATER
+} SensorType_t;
+
+typedef struct {
+    SensorType_t id;  // Który to czujnik?
+    uint32_t value;   // Jaka wartość?
+} SensorMsg_t;
 
 /* USER CODE END ET */
 

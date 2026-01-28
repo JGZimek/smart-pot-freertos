@@ -21,6 +21,7 @@
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "adc.h"
+#include "i2c.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -95,6 +96,7 @@ int main(void)
   MX_GPIO_Init();
   MX_ADC_Init();
   MX_USART1_UART_Init();
+  MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADCEx_Calibration_Start(&hadc);
   /* USER CODE END 2 */
