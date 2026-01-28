@@ -36,17 +36,34 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
+// Typy źródeł danych dla kolejki
 typedef enum {
-    SENSOR_SOIL,
-    SENSOR_LIGHT,
-    SENSOR_WATER
-} SensorType_t;
+    MSG_SRC_SENSOR_SOIL,
+    MSG_SRC_SENSOR_LIGHT,
+    MSG_SRC_SENSOR_WATER,
+    MSG_SRC_BUTTON_VIEW,  // Nowe: Odśwież bo zmieniono widok
+    MSG_SRC_BUTTON_MODE   // Nowe: Odśwież bo zmieniono tryb
+} MsgSource_t;
 
+// Struktura wiadomości w kolejce
 typedef struct {
-    SensorType_t id;  // Który to czujnik?
-    uint32_t value;   // Jaka wartość?
-} SensorMsg_t;
+    MsgSource_t source;
+    uint32_t value; // Dla sensorów to pomiar, dla przycisków może być puste
+} AppMsg_t;
 
+// --- DEFINICJE STANÓW SYSTEMU ---
+typedef enum {
+    VIEW_ALL,   // Pokazuj wszystko (jak teraz)
+    VIEW_SOIL,  // Tylko gleba
+    VIEW_WATER, // Tylko woda
+    VIEW_LIGHT  // Tylko światło
+} DisplayView_t;
+
+typedef enum {
+    MODE_AUTO,   // Automat decyduje o podlewaniu
+    MODE_MANUAL, // Tylko przycisk
+    MODE_REMOTE  // Czekamy na komendy z LoRa/Zigbee (na przyszłość)
+} ControlMode_t;
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/
@@ -67,6 +84,14 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define BTN_VIEW_Pin GPIO_PIN_0
+#define BTN_VIEW_GPIO_Port GPIOA
+#define BTN_MODE_Pin GPIO_PIN_3
+#define BTN_MODE_GPIO_Port GPIOA
+#define BTN_PUMP_Pin GPIO_PIN_2
+#define BTN_PUMP_GPIO_Port GPIOA
+#define RELAY_PUMP_Pin GPIO_PIN_10
+#define RELAY_PUMP_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

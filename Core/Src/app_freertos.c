@@ -52,6 +52,14 @@ extern volatile uint32_t soil_raw_value;
 extern osMutexId_t adcMutexHandle;
 extern osMessageQueueId_t sensorQueueHandle;
 
+static DisplayView_t current_view = VIEW_ALL;
+static ControlMode_t current_mode = MODE_MANUAL;
+static uint8_t is_pump_on = 0;
+
+static uint32_t last_soil = 0;
+static uint32_t last_light = 0;
+static uint32_t last_water = 0;
+
 /* USER CODE END Variables */
 /* Definitions for SoilTask */
 osThreadId_t SoilTaskHandle;
@@ -81,6 +89,13 @@ const osThreadAttr_t DisplayTask_attributes = {
   .priority = (osPriority_t) osPriorityLow,
   .stack_size = 512 * 4
 };
+/* Definitions for ButtonTask */
+osThreadId_t ButtonTaskHandle;
+const osThreadAttr_t ButtonTask_attributes = {
+  .name = "ButtonTask",
+  .priority = (osPriority_t) osPriorityNormal,
+  .stack_size = 128 * 4
+};
 /* Definitions for sensorQueue */
 osMessageQueueId_t sensorQueueHandle;
 const osMessageQueueAttr_t sensorQueue_attributes = {
@@ -99,6 +114,9 @@ const osMutexAttr_t lcdMutex_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
+void ADC_Select_Channel(uint32_t channel);
+void SendAppMessage(MsgSource_t src, uint32_t val);
+void SetPumpState(uint8_t state);
 
 /* USER CODE END FunctionPrototypes */
 
@@ -106,6 +124,7 @@ void StartSoilTask(void *argument);
 void StartLightTask(void *argument);
 void StartWaterTask(void *argument);
 void StartDisplayTask(void *argument);
+void StartButtonTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -158,6 +177,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of DisplayTask */
   DisplayTaskHandle = osThreadNew(StartDisplayTask, NULL, &DisplayTask_attributes);
 
+  /* creation of ButtonTask */
+  ButtonTaskHandle = osThreadNew(StartButtonTask, NULL, &ButtonTask_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -187,7 +209,7 @@ void StartSoilTask(void *argument)
     if (HAL_ADC_PollForConversion(&hadc, 100) == HAL_OK) {
         raw = HAL_ADC_GetValue(&hadc);
         // WYŚLIJ DO KOLEJKI
-        SendSensorData(SENSOR_SOIL, raw);
+        SendAppMessage(MSG_SRC_SENSOR_SOIL, raw);
     }
     HAL_ADC_Stop(&hadc);
     osMutexRelease(adcMutexHandle);
@@ -218,7 +240,7 @@ void StartLightTask(void *argument)
     if (HAL_ADC_PollForConversion(&hadc, 100) == HAL_OK) {
         raw = HAL_ADC_GetValue(&hadc);
         // WYŚLIJ DO KOLEJKI
-        SendSensorData(SENSOR_LIGHT, raw);
+        SendAppMessage(MSG_SRC_SENSOR_LIGHT, raw);
     }
     HAL_ADC_Stop(&hadc);
     osMutexRelease(adcMutexHandle);
@@ -248,7 +270,7 @@ void StartWaterTask(void *argument)
     if (HAL_ADC_PollForConversion(&hadc, 100) == HAL_OK) {
         raw = HAL_ADC_GetValue(&hadc);
         // WYŚLIJ DO KOLEJKI
-        SendSensorData(SENSOR_WATER, raw);
+        SendAppMessage(MSG_SRC_SENSOR_WATER, raw);
     }
     HAL_ADC_Stop(&hadc);
     osMutexRelease(adcMutexHandle);
@@ -268,13 +290,9 @@ void StartWaterTask(void *argument)
 void StartDisplayTask(void *argument)
 {
   /* USER CODE BEGIN StartDisplayTask */
-  SensorMsg_t receivedMsg;
-  char lcd_buffer[20];
-
-  // Lokalne zmienne do pamiętania ostatniego stanu
-  uint32_t last_soil = 0;
-  uint32_t last_light = 0;
-  uint32_t last_water = 0;
+  AppMsg_t msg;
+  char lcd_line1[17];
+  char lcd_line2[17];
 
   // Init LCD
   osMutexAcquire(lcdMutexHandle, osWaitForever);
@@ -284,34 +302,133 @@ void StartDisplayTask(void *argument)
 
   for(;;)
   {
-    // Czekaj na wiadomość z kolejki (osWaitForever usypia taska aż coś przyjdzie!)
-    if (osMessageQueueGet(sensorQueueHandle, &receivedMsg, NULL, osWaitForever) == osOK)
+    // Czekaj na wiadomość
+    if (osMessageQueueGet(sensorQueueHandle, &msg, NULL, osWaitForever) == osOK)
     {
-        // Zaktualizuj odpowiednią zmienną w zależności od ID
-        switch(receivedMsg.id) {
-            case SENSOR_SOIL:  last_soil = receivedMsg.value; break;
-            case SENSOR_LIGHT: last_light = receivedMsg.value; break;
-            case SENSOR_WATER: last_water = receivedMsg.value; break;
+        // Aktualizacja zmiennych
+        switch(msg.source) {
+            case MSG_SRC_SENSOR_SOIL:  last_soil = msg.value; break;
+            case MSG_SRC_SENSOR_LIGHT: last_light = msg.value; break;
+            case MSG_SRC_SENSOR_WATER: last_water = msg.value; break;
+            default: break;
         }
 
-        // --- Logika Wyświetlania ---
-        // Teraz mamy pewność, że mamy najnowsze dane
-        printf("QUEUE UPDATE -> S:%lu L:%lu W:%lu\r\n", last_soil, last_light, last_water);
+        printf("S:%lu L:%lu W:%lu | Mode:%d View:%d P:%d\r\n",
+        			last_soil, last_light, last_water, current_mode, current_view, is_pump_on);
 
+        // Obsługa LCD
         osMutexAcquire(lcdMutexHandle, osWaitForever);
 
+        // --- LINIA 1: Dane ---
         lcd_put_cur(0, 0);
-        sprintf(lcd_buffer, "GLEBA:%4lu W:%4lu", last_soil, last_water);
-        lcd_send_string(lcd_buffer);
+        switch(current_view) {
+            case VIEW_ALL:
+                // Format: "S:1234 L:123 W:12" (ciasno, ale wejdzie)
+                // Używamy %4lu ale jeśli liczba mniejsza to spacje.
+                // S:%lu zajmie zmienną ilość. Spróbujmy na sztywno:
+                // S1234 L1234 W123
+                sprintf(lcd_line1, "S%4lu L%4lu W%3lu", last_soil, last_light, last_water);
+                break;
+            case VIEW_SOIL:
+                sprintf(lcd_line1, "Soil:  %-4lu     ", last_soil);
+                break;
+            case VIEW_WATER:
+                sprintf(lcd_line1, "Water: %-4lu     ", last_water);
+                break;
+            case VIEW_LIGHT:
+                sprintf(lcd_line1, "Light: %-4lu     ", last_light);
+                break;
+        }
+        lcd_send_string(lcd_line1);
 
+        // --- LINIA 2: Status ---
         lcd_put_cur(1, 0);
-        sprintf(lcd_buffer, "SWIAT:%4lu OK    ", last_light);
-        lcd_send_string(lcd_buffer);
+
+        char pump_char = is_pump_on ? '*' : ' ';
+        char *mode_str = "MAN";
+
+        if (current_mode == MODE_AUTO) mode_str = "AUT";
+        else if (current_mode == MODE_REMOTE) mode_str = "RMT ";
+
+        if (current_view == VIEW_ALL) {
+             // Wersja skrócona bez zbędnych nawiasów
+             // M:AUTO P:*
+             sprintf(lcd_line2, "M:%s P:[%c]     ", mode_str, pump_char);
+        } else {
+             // Wersja pełna
+             sprintf(lcd_line2, "Mode:%s P:[%c]   ", mode_str, pump_char);
+        }
+        lcd_send_string(lcd_line2);
 
         osMutexRelease(lcdMutexHandle);
     }
   }
   /* USER CODE END StartDisplayTask */
+}
+
+/* USER CODE BEGIN Header_StartButtonTask */
+/**
+* @brief Function implementing the ButtonTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartButtonTask */
+void StartButtonTask(void *argument)
+{
+  /* USER CODE BEGIN StartButtonTask */
+
+  // 1. INICJALIZACJA: Upewnij się, że pompa jest wyłączona na starcie
+  // Ponieważ używamy Active LOW, SetPumpState(0) ustawi pin w stan WYSOKI (3.3V)
+  SetPumpState(0);
+
+  // Stany poprzednie do wykrywania zboczy (1 = przycisk puszczony)
+  uint8_t last_btn_view = 1;
+  uint8_t last_btn_mode = 1;
+
+  for(;;)
+  {
+    // 2. Odczyt stanów (Pull-Up: wciśnięty = 0, puszczony = 1)
+    uint8_t curr_btn_view = HAL_GPIO_ReadPin(BTN_VIEW_GPIO_Port, BTN_VIEW_Pin);
+    uint8_t curr_btn_mode = HAL_GPIO_ReadPin(BTN_MODE_GPIO_Port, BTN_MODE_Pin);
+    uint8_t curr_btn_pump = HAL_GPIO_ReadPin(BTN_PUMP_GPIO_Port, BTN_PUMP_Pin);
+
+    // 3. Obsługa PRZYCISKU 1 (Zmiana Widoku) - Zbocze opadające
+    if (last_btn_view == 1 && curr_btn_view == 0) {
+        current_view++;
+        if (current_view > VIEW_LIGHT) current_view = VIEW_ALL;
+
+        // Odśwież LCD natychmiast
+        SendAppMessage(MSG_SRC_BUTTON_VIEW, 0);
+    }
+    last_btn_view = curr_btn_view;
+
+    // 4. Obsługa PRZYCISKU 2 (Zmiana Trybu) - Zbocze opadające
+    if (last_btn_mode == 1 && curr_btn_mode == 0) {
+        current_mode++;
+        if (current_mode > MODE_REMOTE) current_mode = MODE_AUTO;
+
+        // Wyłącz pompę przy każdej zmianie trybu dla bezpieczeństwa
+        SetPumpState(0);
+
+        SendAppMessage(MSG_SRC_BUTTON_MODE, 0);
+    }
+    last_btn_mode = curr_btn_mode;
+
+    // 5. Obsługa PRZYCISKU 3 (Pompa Manualna) - Działa tylko w trybie MANUAL
+    if (current_mode == MODE_MANUAL) {
+        if (curr_btn_pump == 0) { // Przycisk trzymany (Stan niski)
+            if (is_pump_on == 0) SetPumpState(1); // Włącz (logika w funkcji SetPumpState zrobi reset pinu)
+        } else { // Przycisk puszczony
+            if (is_pump_on == 1) SetPumpState(0); // Wyłącz (ustaw pin)
+        }
+    } else {
+        // Zabezpieczenie: jeśli w innym trybie pompa została włączona, wyłącz ją
+        if (is_pump_on && current_mode != MODE_AUTO) SetPumpState(0);
+    }
+
+    osDelay(20); // Debouncing (filtracja drgań styków)
+  }
+  /* USER CODE END StartButtonTask */
 }
 
 /* Private application code --------------------------------------------------*/
@@ -325,13 +442,23 @@ void ADC_Select_Channel(uint32_t channel)
   if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK) { Error_Handler(); }
 }
 
-// Funkcja pomocnicza do wysyłania danych do kolejki
-void SendSensorData(SensorType_t type, uint32_t value) {
-    SensorMsg_t msg;
-    msg.id = type;
-    msg.value = value;
-    // Czekaj 0ms. Jeśli kolejka pełna, trudno, przepadnie jeden odczyt (nie blokujemy sensora)
+void SendAppMessage(MsgSource_t src, uint32_t val) {
+    AppMsg_t msg;
+    msg.source = src;
+    msg.value = val;
     osMessageQueuePut(sensorQueueHandle, &msg, 0, 0);
+}
+
+void SetPumpState(uint8_t state) {
+    if (state == 1) {
+        // WŁĄCZANIE: Stan NISKI (GND) uruchamia przekaźnik
+        HAL_GPIO_WritePin(RELAY_PUMP_GPIO_Port, RELAY_PUMP_Pin, GPIO_PIN_RESET);
+        is_pump_on = 1;
+    } else {
+        // WYŁĄCZANIE: Stan WYSOKI (3.3V) wyłącza przekaźnik
+        HAL_GPIO_WritePin(RELAY_PUMP_GPIO_Port, RELAY_PUMP_Pin, GPIO_PIN_SET);
+        is_pump_on = 0;
+    }
 }
 
 /* USER CODE END Application */
