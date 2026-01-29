@@ -55,9 +55,7 @@ extern osMutexId_t lcdMutexHandle;
 // Kolejki zdefiniowane w CubeMX
 extern osMessageQueueId_t sensorQueueHandle;
 extern osMessageQueueId_t commandQueueHandle;
-
 extern UART_HandleTypeDef huart1;
-
 extern IWDG_HandleTypeDef hiwdg;
 
 // Bufor na jeden znak odebrany z klawiatury
@@ -89,13 +87,14 @@ volatile SystemState_t sysState = {
 
 #define SRC_ID_BUTTON 1
 #define SRC_ID_REMOTE 2
+#define MSG_CMD_SET_MODE_DIRECT 10
 
 /* USER CODE END Variables */
 /* Definitions for SoilTask */
 osThreadId_t SoilTaskHandle;
 const osThreadAttr_t SoilTask_attributes = {
   .name = "SoilTask",
-  .priority = (osPriority_t) osPriorityNormal,
+  .priority = (osPriority_t) osPriorityLow,
   .stack_size = 256 * 4
 };
 /* Definitions for LightTask */
@@ -130,7 +129,7 @@ const osThreadAttr_t ButtonTask_attributes = {
 osThreadId_t ControlTaskHandle;
 const osThreadAttr_t ControlTask_attributes = {
   .name = "ControlTask",
-  .priority = (osPriority_t) osPriorityBelowNormal,
+  .priority = (osPriority_t) osPriorityNormal,
   .stack_size = 256 * 4
 };
 /* Definitions for CommTask */
@@ -361,13 +360,12 @@ void StartDisplayTask(void *argument)
 
   for(;;)
   {
-    // 1. Logowanie UART (Co odświeżenie ekranu)
-    // Przywrócony printf z \r\n na końcu
-    printf("S:%lu L:%lu W:%lu | Mode:%d View:%d P:%d\r\n",
+    // Logowanie UART - Dla Maszyny (Python/Firebase Bridge)
+    printf("JSON:{\"soil\":%lu,\"light\":%lu,\"water\":%lu,\"mode\":%d,\"pump\":%d}\r\n",
            sysState.soil, sysState.light, sysState.water,
-           sysState.mode, sysState.view, sysState.pump_active);
+           sysState.mode, sysState.pump_active);
 
-    // 2. Obsługa LCD
+    // Obsługa LCD
     osMutexAcquire(lcdMutexHandle, osWaitForever);
 
     // --- LINIA 1: Dane ---
@@ -409,7 +407,7 @@ void StartDisplayTask(void *argument)
 
     osMutexRelease(lcdMutexHandle);
 
-    osDelay(500); // Odświeżanie 2Hz (optymalne dla UART i oczu)
+    osDelay(500); // Odświeżanie 2Hz
   }
   /* USER CODE END StartDisplayTask */
 }
@@ -477,9 +475,9 @@ void StartControlTask(void *argument)
 
   for(;;)
   {
-	// --- TUTAJ ODŚWIEŻAMY WATCHDOGA ---
-	HAL_IWDG_Refresh(&hiwdg);
-    // A. Komendy
+    HAL_IWDG_Refresh(&hiwdg);
+
+    // A. Odbiór komend
     if (osMessageQueueGet(commandQueueHandle, &msg, NULL, 0) == osOK) {
         switch(msg.source) {
             case MSG_CMD_CHANGE_VIEW:
@@ -487,19 +485,26 @@ void StartControlTask(void *argument)
                 if (sysState.view > VIEW_LIGHT) sysState.view = VIEW_ALL;
                 break;
 
-            case MSG_CMD_CHANGE_MODE:
+            case MSG_CMD_CHANGE_MODE: // Kliknięcie przycisku (cykliczne)
                 sysState.mode++;
                 if (sysState.mode > MODE_REMOTE) sysState.mode = MODE_MANUAL;
-
-                // Zawsze resetuj pompę przy zmianie trybu
                 SetPumpHardware(0);
                 sysState.pump_active = 0;
                 break;
 
+            // --- NOWOŚĆ: BEZPOŚREDNIE USTAWIANIE TRYBU (Zdalne) ---
+            case MSG_CMD_SET_MODE_DIRECT:
+                // msg.value zawiera docelowy tryb (0=MAN, 1=AUTO, 2=REMOTE)
+                // Sprawdźmy poprawność zakresu
+                if (msg.value <= MODE_REMOTE) {
+                    sysState.mode = (ControlMode_t)msg.value;
+                    // Reset pompy przy każdej zmianie trybu dla bezpieczeństwa
+                    SetPumpHardware(0);
+                    sysState.pump_active = 0;
+                }
+                break;
+
             case MSG_CMD_PUMP_REQ_ON:
-                // Logika:
-                // - Jeśli tryb MANUAL -> akceptuj tylko od PRZYCISKU (SRC_ID_BUTTON)
-                // - Jeśli tryb REMOTE -> akceptuj tylko od UART (SRC_ID_REMOTE)
                 if ( (sysState.mode == MODE_MANUAL && msg.value == SRC_ID_BUTTON) ||
                      (sysState.mode == MODE_REMOTE && msg.value == SRC_ID_REMOTE) )
                 {
@@ -509,7 +514,6 @@ void StartControlTask(void *argument)
                 break;
 
             case MSG_CMD_PUMP_REQ_OFF:
-                // Ta sama logika dla wyłączania
                 if ( (sysState.mode == MODE_MANUAL && msg.value == SRC_ID_BUTTON) ||
                      (sysState.mode == MODE_REMOTE && msg.value == SRC_ID_REMOTE) )
                 {
@@ -522,7 +526,7 @@ void StartControlTask(void *argument)
         }
     }
 
-    // B. Sensory (bez zmian)
+    // B. Sensory
     if (osMessageQueueGet(sensorQueueHandle, &msg, NULL, 5) == osOK) {
         switch(msg.source) {
             case MSG_SRC_SENSOR_SOIL:  sysState.soil = msg.value; break;
@@ -532,7 +536,7 @@ void StartControlTask(void *argument)
         }
     }
 
-    // C. Logika AUTO (bez zmian)
+    // C. Logika AUTO
     if (sysState.mode == MODE_AUTO) {
         if (sysState.soil < SOIL_DRY_THRESHOLD && sysState.water > WATER_MIN_LEVEL) {
             if (sysState.pump_active == 0) {
@@ -563,28 +567,38 @@ void StartControlTask(void *argument)
 void StartCommTask(void *argument)
 {
   /* USER CODE BEGIN StartCommTask */
-
-  // 1. Start nasłuchu na przerwanie (używamy poprawnej nazwy zmiennej 'rx_char')
+  // 1. Start nasłuchu na przerwanie (1 znak)
   HAL_UART_Receive_IT(&huart1, &rx_char, 1);
 
   for(;;)
   {
-    // 2. Czekaj na flagę od przerwania
+    // 2. Czekaj na flagę z przerwania RxCpltCallback
     osThreadFlagsWait(0x01, osFlagsWaitAny, osWaitForever);
 
-    // 3. Logika komend
-    // Wysyłamy komendę z podpisem SRC_ID_REMOTE (2)
+    // 3. Logika komend UART
     if (rx_char == '1') {
-        printf("\r\nREMOTE: Sent ON request\r\n");
+        // Włącz pompę
         SendCommand(MSG_CMD_PUMP_REQ_ON, SRC_ID_REMOTE);
     }
     else if (rx_char == '0') {
-        printf("\r\nREMOTE: Sent OFF request\r\n");
+        // Wyłącz pompę
         SendCommand(MSG_CMD_PUMP_REQ_OFF, SRC_ID_REMOTE);
     }
-    // Opcjonalnie: ignoruj inne znaki (np. Enter)
+    // --- NOWOŚĆ: Zmiana trybów ---
+    else if (rx_char == 'M') {
+        // Ustaw tryb MANUAL (0)
+        SendCommand(MSG_CMD_SET_MODE_DIRECT, MODE_MANUAL);
+    }
+    else if (rx_char == 'A') {
+        // Ustaw tryb AUTO (1)
+        SendCommand(MSG_CMD_SET_MODE_DIRECT, MODE_AUTO);
+    }
+    else if (rx_char == 'R') {
+        // Ustaw tryb REMOTE (2)
+        SendCommand(MSG_CMD_SET_MODE_DIRECT, MODE_REMOTE);
+    }
 
-    // 4. Wznów nasłuch (ponownie używamy poprawnej nazwy 'rx_char')
+    // 4. Wznów nasłuch
     HAL_UART_Receive_IT(&huart1, &rx_char, 1);
   }
   /* USER CODE END StartCommTask */
