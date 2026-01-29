@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <stdlib.h>
 #include "adc.h"
 #include "lcd_i2c.h"
 #include "usart.h"
@@ -70,6 +71,8 @@ typedef struct {
     ControlMode_t mode;
     DisplayView_t view;
     uint8_t pump_active;
+    uint32_t soil_dry_threshold;
+    uint32_t soil_wet_threshold;
 } SystemState_t;
 
 // Inicjalizacja stanu zerowego
@@ -77,17 +80,18 @@ volatile SystemState_t sysState = {
     .soil = 0, .light = 0, .water = 0,
     .mode = MODE_MANUAL,
     .view = VIEW_ALL,
-    .pump_active = 0
+    .pump_active = 0,
+	.soil_dry_threshold = 1500,
+	.soil_wet_threshold = 1800
 };
 
 // Progi dla automatyki
-#define SOIL_DRY_THRESHOLD 1500  // Poniżej tego włączamy pompę
-#define SOIL_WET_THRESHOLD 1800  // Powyżej tego wyłączamy (histereza)
 #define WATER_MIN_LEVEL 200      // Minimum wody w zbiorniku
 
 #define SRC_ID_BUTTON 1
 #define SRC_ID_REMOTE 2
 #define MSG_CMD_SET_MODE_DIRECT 10
+#define MSG_CMD_SET_DRY_THRESH  20
 
 /* USER CODE END Variables */
 /* Definitions for SoilTask */
@@ -467,9 +471,9 @@ void StartButtonTask(void *argument)
 * @retval None
 */
 /* USER CODE END Header_StartControlTask */
+/* USER CODE BEGIN Header_StartControlTask */
 void StartControlTask(void *argument)
 {
-  /* USER CODE BEGIN StartControlTask */
   AppMsg_t msg;
   SetPumpHardware(0);
 
@@ -477,7 +481,7 @@ void StartControlTask(void *argument)
   {
     HAL_IWDG_Refresh(&hiwdg);
 
-    // A. Odbiór komend
+    // A. Komendy
     if (osMessageQueueGet(commandQueueHandle, &msg, NULL, 0) == osOK) {
         switch(msg.source) {
             case MSG_CMD_CHANGE_VIEW:
@@ -485,22 +489,28 @@ void StartControlTask(void *argument)
                 if (sysState.view > VIEW_LIGHT) sysState.view = VIEW_ALL;
                 break;
 
-            case MSG_CMD_CHANGE_MODE: // Kliknięcie przycisku (cykliczne)
+            case MSG_CMD_CHANGE_MODE:
                 sysState.mode++;
                 if (sysState.mode > MODE_REMOTE) sysState.mode = MODE_MANUAL;
                 SetPumpHardware(0);
                 sysState.pump_active = 0;
                 break;
 
-            // --- NOWOŚĆ: BEZPOŚREDNIE USTAWIANIE TRYBU (Zdalne) ---
             case MSG_CMD_SET_MODE_DIRECT:
-                // msg.value zawiera docelowy tryb (0=MAN, 1=AUTO, 2=REMOTE)
-                // Sprawdźmy poprawność zakresu
                 if (msg.value <= MODE_REMOTE) {
                     sysState.mode = (ControlMode_t)msg.value;
-                    // Reset pompy przy każdej zmianie trybu dla bezpieczeństwa
                     SetPumpHardware(0);
                     sysState.pump_active = 0;
+                }
+                break;
+
+            // Ustawianie progu
+            case MSG_CMD_SET_DRY_THRESH:
+                if (msg.value < 4096) {
+                    sysState.soil_dry_threshold = msg.value;
+                    // Histereza -300 (Wysoka wartość = sucho, więc mokro = mniej)
+                    if (msg.value > 300) sysState.soil_wet_threshold = msg.value - 300;
+                    else sysState.soil_wet_threshold = 0;
                 }
                 break;
 
@@ -536,15 +546,17 @@ void StartControlTask(void *argument)
         }
     }
 
-    // C. Logika AUTO
+    // C. Logika AUTO - POPRAWIONA (Dla czujników gdzie High = Dry)
     if (sysState.mode == MODE_AUTO) {
-        if (sysState.soil < SOIL_DRY_THRESHOLD && sysState.water > WATER_MIN_LEVEL) {
+        // Włącz jeśli wartość jest WIĘKSZA niż próg (czyli jest za SUCHO)
+        if (sysState.soil > sysState.soil_dry_threshold && sysState.water > WATER_MIN_LEVEL) {
             if (sysState.pump_active == 0) {
                 SetPumpHardware(1);
                 sysState.pump_active = 1;
             }
         }
-        else if (sysState.soil > SOIL_WET_THRESHOLD || sysState.water < WATER_MIN_LEVEL) {
+        // Wyłącz jeśli wartość spadnie poniżej progu mokrości (czyli zrobiło się MOKRO)
+        else if (sysState.soil < sysState.soil_wet_threshold || sysState.water < WATER_MIN_LEVEL) {
             if (sysState.pump_active == 1) {
                 SetPumpHardware(0);
                 sysState.pump_active = 0;
@@ -554,8 +566,8 @@ void StartControlTask(void *argument)
 
     osDelay(10);
   }
-  /* USER CODE END StartControlTask */
 }
+/* USER CODE END Header_StartControlTask */
 
 /* USER CODE BEGIN Header_StartCommTask */
 /**
@@ -564,45 +576,59 @@ void StartControlTask(void *argument)
 * @retval None
 */
 /* USER CODE END Header_StartCommTask */
+/* USER CODE BEGIN Header_StartCommTask */
+/* USER CODE BEGIN Header_StartCommTask */
 void StartCommTask(void *argument)
 {
-  /* USER CODE BEGIN StartCommTask */
-  // 1. Start nasłuchu na przerwanie (1 znak)
-  HAL_UART_Receive_IT(&huart1, &rx_char, 1);
+  // 1. Start nasłuchu (zabezpieczony pętlą)
+  while(HAL_UART_Receive_IT(&huart1, &rx_char, 1) != HAL_OK) {
+      osDelay(5); // Czekaj, jeśli UART jest zajęty
+  }
+
+  uint8_t buf[5]; // Bufor na 4 cyfry + null
 
   for(;;)
   {
-    // 2. Czekaj na flagę z przerwania RxCpltCallback
+    // 2. Czekaj na flagę z przerwania (przyjście znaku)
     osThreadFlagsWait(0x01, osFlagsWaitAny, osWaitForever);
 
-    // 3. Logika komend UART
+    // 3. Analiza znaku
     if (rx_char == '1') {
-        // Włącz pompę
         SendCommand(MSG_CMD_PUMP_REQ_ON, SRC_ID_REMOTE);
     }
     else if (rx_char == '0') {
-        // Wyłącz pompę
         SendCommand(MSG_CMD_PUMP_REQ_OFF, SRC_ID_REMOTE);
     }
-    // --- NOWOŚĆ: Zmiana trybów ---
     else if (rx_char == 'M') {
-        // Ustaw tryb MANUAL (0)
         SendCommand(MSG_CMD_SET_MODE_DIRECT, MODE_MANUAL);
     }
     else if (rx_char == 'A') {
-        // Ustaw tryb AUTO (1)
         SendCommand(MSG_CMD_SET_MODE_DIRECT, MODE_AUTO);
     }
     else if (rx_char == 'R') {
-        // Ustaw tryb REMOTE (2)
         SendCommand(MSG_CMD_SET_MODE_DIRECT, MODE_REMOTE);
     }
+    // --- Odbiór wartości progu 'Dxxxx' ---
+    else if (rx_char == 'D') {
+        // Blokująco odbierz kolejne 4 znaki.
+        // Uwaga: To może kolidować z printf, ale HAL_UART_Receive ma timeout.
+        if (HAL_UART_Receive(&huart1, buf, 4, 100) == HAL_OK) {
+            buf[4] = 0; // Null terminator
+            uint32_t val = atoi((char*)buf);
+            SendCommand(MSG_CMD_SET_DRY_THRESH, val);
+        }
+    }
 
-    // 4. Wznów nasłuch
-    HAL_UART_Receive_IT(&huart1, &rx_char, 1);
+    // 4. Wznów nasłuch - TO JEST KLUCZOWA POPRAWKA
+    // Jeśli printf() akurat wysyła JSON, UART będzie ZAJĘTY (HAL_BUSY).
+    // Musimy próbować do skutku, inaczej przerwania odbioru zgasną na zawsze!
+    while(HAL_UART_Receive_IT(&huart1, &rx_char, 1) != HAL_OK) {
+        osDelay(1); // Krótkie czekanie i ponowna próba
+    }
   }
-  /* USER CODE END StartCommTask */
 }
+/* USER CODE END Header_StartCommTask */
+/* USER CODE END Header_StartCommTask */
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
